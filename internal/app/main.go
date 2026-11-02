@@ -77,7 +77,10 @@ func (a *App) HandleMethod(method string, request []byte) ([]byte, error) {
 		// 在该列表里，登录/添加账号只走插件自己的控制台。
 		// 但必须同时用 credential_providers 认领 auth 文件里的 type=freetier，
 		// 否则宿主的 authProviderEntry 会认不出这些凭证，模型与执行器全部掉线。
-		return core.OKEnvelope(identifierResponse{CredentialProviders: []string{providerKey}})
+		// 两个字段都要给：新宿主用 credential_providers 认领，旧宿主（如 8.0.8，
+		// 二进制里没有 credential_providers 字段）只认 Identifier。少给 Identifier
+		// 会让旧宿主认不出 type=freetier 的凭证 —— 账号掉线、模型为 0、执行器不触发。
+		return core.OKEnvelope(identifierResponse{Identifier: providerKey, CredentialProviders: []string{providerKey}})
 	case pluginabi.MethodAuthParse:
 		return a.handleAuthParse(request)
 	case pluginabi.MethodAuthLoginStart:

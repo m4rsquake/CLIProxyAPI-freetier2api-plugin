@@ -12,7 +12,8 @@ import (
 )
 
 // 面板「OAuth 登录」列表按 oauth_provider 过滤，空则不渲染；
-// 同时 credential_providers 必须认领 type=freetier，否则凭证全掉线。
+// 同时 credential_providers 与 identifier 都必须认领 freetier：
+// 新宿主认 credential_providers，旧宿主（8.0.8 及更早）只认 identifier。
 func TestAuthIdentifierHidesOAuthButKeepsCredentialProvider(t *testing.T) {
 	a := &App{}
 	raw, err := a.HandleMethod(pluginabi.MethodAuthIdentifier, []byte(`{}`))
@@ -33,8 +34,15 @@ func TestAuthIdentifierHidesOAuthButKeepsCredentialProvider(t *testing.T) {
 	if !env.OK {
 		t.Fatalf("not ok: %s", raw)
 	}
-	if env.Data.Identifier != "" || len(env.Data.Identifiers) != 0 {
-		t.Fatalf("oauth identifiers must be empty: %s", raw)
+	// identifier 必须保留：CPA 8.0.8 这类旧宿主的二进制里没有 credential_providers
+	// 字段，只认 identifier；少了它宿主认不出 type=freetier 的凭证，账号全部掉线、
+	// /v1/models 里一个模型都没有。面板的「OAuth 登录」列表按 oauth_provider 过滤，
+	// 与 identifier 无关，所以保留它不会把插件塞进登录列表。
+	if env.Data.Identifier != "freetier" {
+		t.Fatalf("identifier must stay freetier for older hosts: %s", raw)
+	}
+	if len(env.Data.Identifiers) != 0 {
+		t.Fatalf("extra identifiers must stay empty: %s", raw)
 	}
 	if len(env.Data.CredentialProviders) != 1 || env.Data.CredentialProviders[0] != "freetier" {
 		t.Fatalf("credential providers must claim freetier: %s", raw)
