@@ -404,8 +404,13 @@ func (v *adapter) MergeStorageJSON(original []byte, credential *core.Credential)
 
 // bridgeEntry 是缓存的一条 Bridge。
 type bridgeEntry struct {
-	bridge    *Bridge
-	createdAt time.Time
+	bridge *Bridge
+	// fingerprint 是建立这条会话时凭证的指纹。
+	//
+	// 缓存键本身含指纹，凭证轮换后旧键再也 Load 不到；把指纹也存一份，
+	// 是为了让清理逻辑能识别「这条条目对应的凭证已经不是当前凭证」。
+	fingerprint string
+	createdAt   time.Time
 }
 
 // bridgeFor 取（或建立）该凭证的 cosy 会话。
@@ -413,10 +418,11 @@ type bridgeEntry struct {
 // 缓存是必需的：建会话要一次 jobToken 交换 + RSA 加密，每个请求重建
 // 会让上游看到大量重复的令牌交换。
 func (v *adapter) bridgeFor(ctx context.Context, cred *Credential) (*Bridge, error) {
+	fingerprint := CredentialFingerprint(cred)
 	key := v.bridgeCacheKey(cred)
 	if cached, okCached := v.bridges.Load(key); okCached {
 		entry, okEntry := cached.(bridgeEntry)
-		if okEntry && time.Since(entry.createdAt) < qoderBridgeTTL {
+		if okEntry && entry.fingerprint == fingerprint && time.Since(entry.createdAt) < qoderBridgeTTL {
 			return entry.bridge, nil
 		}
 		v.bridges.Delete(key)
@@ -432,8 +438,40 @@ func (v *adapter) bridgeFor(ctx context.Context, cred *Credential) (*Bridge, err
 	if errBridge != nil {
 		return nil, ClassifyCredentialError(errBridge)
 	}
-	v.bridges.Store(key, bridgeEntry{bridge: b, createdAt: time.Now()})
+	v.bridges.Store(key, bridgeEntry{bridge: b, fingerprint: fingerprint, createdAt: time.Now()})
+	v.sweepBridges()
 	return b, nil
+}
+
+// sweepBridges 清掉过期条目。
+//
+// 缓存键里含凭证指纹，而凭证每 30 分钟续期一次就可能换出新的 token，
+// 于是「旧键」再也不会被 Load 到——只靠 bridgeFor 里的同键删除会让
+// 每一条旧 Bridge 永久驻留。每条 Bridge 持有解析后的 65 KB 提示词模板
+// （实测约 105 KB 常驻），一天 48 次续期就是每个账号约 5 MB/天的净增长，
+// 且与对话流量无关，这正是线上进程 RSS 单调上涨的来源。
+//
+// 过期条目即便正在被调用方使用也可以删：调用方持有 *Bridge 指针，
+// 删除只是让下一次请求重建会话，与 TTL 到期后的既有行为一致。
+func (v *adapter) sweepBridges() {
+	now := time.Now()
+	v.bridges.Range(func(key, value any) bool {
+		entry, okEntry := value.(bridgeEntry)
+		if !okEntry || now.Sub(entry.createdAt) >= qoderBridgeTTL {
+			v.bridges.Delete(key)
+		}
+		return true
+	})
+}
+
+// bridgeCacheSize 返回当前缓存的会话条数（测试与诊断用）。
+func (v *adapter) bridgeCacheSize() int {
+	count := 0
+	v.bridges.Range(func(_, _ any) bool {
+		count++
+		return true
+	})
+	return count
 }
 
 // bridgeCacheKey 生成 Bridge 的缓存键。

@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // Level 是日志级别。数值越大越严重。
@@ -30,6 +31,14 @@ const (
 
 // ringCapacity 是内存环容量。管理页默认一次拉 200 条，1000 条足够回溯。
 const ringCapacity = 1000
+
+// ringEntryMaxBytes 是单条日志进入内存环时的上限。
+//
+// 环按「条数」封顶，而调用方会打出整段上游响应（模型清单 47 KB、整包
+// 请求体等）。1000 条 × 单条几十 KB 就是几十 MB 的常驻下限——在 1.6 GB
+// 的机器上这就是 OOM 的最后一根稻草。这里只截断环里的副本，stderr 与
+// 文件仍写完整内容（排障时看文件）。
+const ringEntryMaxBytes = 8 << 10
 
 // fileRetentionDays 是按天日志文件的保留天数。
 const fileRetentionDays = 7
@@ -134,9 +143,31 @@ func openLogFileLocked(now time.Time) error {
 	if errOpen != nil {
 		return fmt.Errorf("open log file %s: %w", path, errOpen)
 	}
+	// 跨天轮转也走这里：先把上一天的句柄关掉再替换，否则每天泄漏一个 fd
+	// （长期运行后进程 fd 只增不减，还会让旧文件无法删除/回收）。
+	if fileSink != nil && fileSink != file {
+		if errClose := fileSink.Close(); errClose != nil {
+			fmt.Fprintf(os.Stderr, "[freetier] close previous log file failed: %v\n", errClose)
+		}
+	}
 	fileSink = file
 	fileDay = day
 	return nil
+}
+
+// clipForRing 截断进入内存环的单条日志。
+//
+// 只截环里的副本：stderr 与文件写的是完整内容。
+func clipForRing(message string) string {
+	if len(message) <= ringEntryMaxBytes {
+		return message
+	}
+	// 按字节截断可能切在多字节字符中间，退到上一个合法边界。
+	cut := ringEntryMaxBytes
+	for cut > 0 && !utf8.RuneStart(message[cut]) {
+		cut--
+	}
+	return message[:cut] + fmt.Sprintf("…（环内截断，原长 %d 字节）", len(message))
 }
 
 // pruneLogFiles 删除超过保留期的日志文件。
@@ -199,7 +230,7 @@ func log(lvl Level, label string, format string, args ...any) {
 	globalRing.append(Entry{
 		Time:    now.Format("2006-01-02 15:04:05.000"),
 		Level:   strings.ToLower(label),
-		Message: message,
+		Message: clipForRing(message),
 	})
 
 	fileMu.Lock()

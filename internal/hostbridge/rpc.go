@@ -89,9 +89,25 @@ func current() (Caller, error) {
 // Call 发起一次宿主回调。
 //
 // callbackID 为空表示后台任务（无请求作用域）。优先使用 CallCtx，
-// 让回调 ID 跟随 context 传递。
+// 让回调 ID 跟随 context 传递。这里没有调用方上下文可等，等价于
+// 不设截止时间（后台任务本来就该等到底）。
 func Call(callbackID, method string, payload any) (json.RawMessage, error) {
-	if errAcquire := acquire(); errAcquire != nil {
+	return callWithContext(context.Background(), callbackID, method, payload)
+}
+
+// CallCtx 发起一次宿主回调，callback ID 从 context 取。
+//
+// 槽位等待受 ctx 约束：宿主卡住时排队中的调用会随请求上下文（超时、
+// 下游断开）及时退出，而不是把整条 prepared 请求体永久停在门上。
+func CallCtx(ctx context.Context, method string, payload any) (json.RawMessage, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return callWithContext(ctx, CallbackID(ctx), method, payload)
+}
+
+func callWithContext(ctx context.Context, callbackID, method string, payload any) (json.RawMessage, error) {
+	if errAcquire := acquire(ctx); errAcquire != nil {
 		return nil, errAcquire
 	}
 	defer release()
@@ -102,16 +118,15 @@ func Call(callbackID, method string, payload any) (json.RawMessage, error) {
 	return impl(callbackID, method, payload)
 }
 
-// CallCtx 发起一次宿主回调，callback ID 从 context 取。
-func CallCtx(ctx context.Context, method string, payload any) (json.RawMessage, error) {
-	return Call(CallbackID(ctx), method, payload)
-}
-
 // acquire 申请一个宿主调用槽位。
 //
 // 准入检查与 WaitGroup.Add 必须在同一把锁内完成，否则 Wait 可能观察到
 // 零计数，导致关闭排空提前返回并在活跃栈上 dlclose。
-func acquire() error {
+//
+// 等槽位可以被 ctx 打断：宿主回调本身不可取消，但**排队**是可以放弃的。
+// 少了这一步，宿主一慢下来（或某类回调卡住），新请求就会在 gate 上无限
+// 堆积——每个排队 goroutine 都还持有完整请求体，逐次到达即无限增长。
+func acquire(ctx context.Context) error {
 	gateMu.Lock()
 	if shuttingDown {
 		gateMu.Unlock()
@@ -119,8 +134,31 @@ func acquire() error {
 	}
 	inflightWG.Add(1)
 	gateMu.Unlock()
-	gate <- struct{}{}
-	return nil
+
+	if ctx != nil {
+		select {
+		case <-ctx.Done():
+			inflightWG.Done()
+			return ctx.Err()
+		default:
+		}
+	}
+	select {
+	case gate <- struct{}{}:
+		return nil
+	case <-done(ctx):
+		// 没拿到槽位就撤，必须把准入计数还回去，否则关闭排空会永远等。
+		inflightWG.Done()
+		return ctx.Err()
+	}
+}
+
+// done 把「没有 context」归一成永不关闭的通道，让 acquire 只有一个 select 分支形态。
+func done(ctx context.Context) <-chan struct{} {
+	if ctx == nil {
+		return nil
+	}
+	return ctx.Done()
 }
 
 func release() {

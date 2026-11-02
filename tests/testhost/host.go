@@ -103,6 +103,23 @@ func (h *Host) Call(callbackID, method string, payload any) (json.RawMessage, er
 	return nil, fmt.Errorf("fake host does not implement %s", method)
 }
 
+// ResetRecords 清空本次运行的全部调用/流式记录，供长跑压测使用。
+//
+// 假宿主会为每次宿主回调、每个流追加记录；压测里这些记录本身就是无界的，
+// 不清空会把「测试骨架的增长」误判成「插件泄漏」。
+func (h *Host) ResetRecords() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.calls = h.calls[:0]
+	h.callbackIDs = h.callbackIDs[:0]
+	h.emits = h.emits[:0]
+	h.streamErr = h.streamErr[:0]
+	h.closed = h.closed[:0]
+	h.streams = map[string]*Stream{}
+	h.nextStream = 0
+	h.upstreamCalls = 0
+}
+
 // CallbackIDs 返回每次宿主回调携带的回调 ID（副本，按调用顺序）。
 func (h *Host) CallbackIDs() []string {
 	h.mu.Lock()
