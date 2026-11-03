@@ -196,7 +196,13 @@ func (a *App) Registration() registration {
 			ConfigFields:     a.configFields(),
 		},
 		Capabilities: registrationCapabilities{
-			ResponseBeforeTranslator: true,
+			// 关闭：本插件只在「跨协议流式转换」时才需要 response.normalize_before，
+			// 而宿主调用该钩子时会把完整 OriginalRequest/TranslatedRequest 一并
+			// 序列化（长上下文下每帧数 MB），本部署只有 OpenAI 格式客户端
+			// （/v1/chat/completions），从来用不上，属于纯开销。
+			// 若将来接入 Claude 格式客户端（/v1/messages）并出现丢帧，
+			// 把它改回 true 即可（参见 internal/app/responsegate.go）。
+			ResponseBeforeTranslator: false,
 
 			ModelProvider: true,
 			AuthProvider:  true,
